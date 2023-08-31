@@ -9,6 +9,7 @@
 
 #include <optional>
 #include <array>
+#include <coroutine>
 #include "mg_port.h"
 
 namespace magnesium {
@@ -17,7 +18,10 @@ template<class T> using option = std::optional<T>;
 
 template<class T> class owner {
     T* ptr;
+       
+    void drop(T*);
 public:
+
     owner(T* pointer) noexcept : ptr(pointer) {}
 
     owner(owner&& other) noexcept : ptr(other.ptr) {
@@ -26,7 +30,7 @@ public:
     
     ~owner() {
         if (ptr != nullptr) {
-            ptr->drop();
+            drop(ptr);
         }
     }
     
@@ -40,19 +44,11 @@ public:
         return ptr; // TODO: assert ptr != nullptr
     }
 
-    template<class U> const U* as() const {
-        return static_cast<const U*>(ptr);
-    }
-
     owner(std::nullptr_t) = delete;
     owner(const owner&) = delete;
     owner& operator=(const owner& other) = delete;
     owner& operator=(owner&& other) = delete;
 };
-
-class queue_base;
-class actor;
-class message;
 
 class node {
     node* next;
@@ -73,12 +69,12 @@ public:
 };
 
 class list : public node {
+public:
 
     inline bool is_empty() const {
         return (this->next == this);
     }
 
-public:
     list() noexcept {
         this->next = this->prev = this;
     }
@@ -106,14 +102,10 @@ public:
     }   
 };
 
-class message : public node {
-    queue_base* parent;
-public:
-    inline void set_parent(queue_base* q) {
-        parent = q;
-    }
+class queue_base {};
 
-    void drop() noexcept;
+struct message : public node {
+    queue_base* parent;
 };
 
 class mutex {};
@@ -130,53 +122,55 @@ public:
     }
 };
 
-class queue_base {
-    list items;
-    int length = 0;
- 
-    inline option<owner<actor>> push_internal(owner<message>& msg);
-protected:
-    mutex lock;
-    ~queue_base() = default;
-public:
-    option<owner<message>> pop(option<owner<actor>>&& subscriber);
-    void push(owner<message>&& msg);
+struct future {
+    struct promise_type {
+        static void* allocate(std::size_t n);        
+        future get_return_object() { return {}; }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void unhandled_exception() {}
+        void* operator new(std::size_t n) { return allocate(n); }
+    };
 };
 
-void message::drop() noexcept {
-    parent->push(owner(this));
-}
+template<class T> class queue;
 
 class actor : public node {
-    option<owner<message>> mailbox;
-
-    virtual queue_base& run(owner<message> msg) = 0;
+    message* mailbox = nullptr;
+    std::coroutine_handle<> frame;
+        
+    virtual future run() = 0;
 protected:
     ~actor() = default;
-public:
+public:   
     const unsigned int vect;
     const unsigned int prio;
 
-    actor(unsigned int vect) noexcept : mailbox(), vect(vect), prio(pic_vect2prio(vect)) {}
+    actor(unsigned int vect) noexcept : vect(vect), prio(pic_vect2prio(vect)) {}
 
-    inline void poll(queue_base& q) {
-        q.pop(owner(this));
-        // TODO: assert queue is empty
+    template<class T> inline void set_message(owner<T>& msg) {
+        mailbox = msg.release();
+    }
+    
+    template<class T> inline owner<T> get_message() {
+        message* temp = mailbox;
+        mailbox = nullptr;
+        return owner<T>(static_cast<T*>(temp));
+    }    
+
+    inline void set_handle(std::coroutine_handle<> handle) {
+        frame = handle;
+    }
+        
+    void call() {
+        frame();
     }
 
-    inline void set_message(owner<message>& msg) {
-        mailbox.emplace(std::move(msg));
-    }
+    inline void start() {
+        this->run();
+    }  
 
-    inline queue_base& call() {
-        // TODO: assert mailbox nonempty
-        actor* me = this;
-        return me->run(std::move(*mailbox));
-    }
-
-    void drop() noexcept {
-        // TODO: assert actors should never be dropped
-    }
+    template<class T> inline auto pop(queue<T>& q);
 };
    
 class scheduler {
@@ -201,67 +195,106 @@ public:
 
         while (option<owner<actor>> item = extract(context.runqueue[prio])) {
             auto& active_actor = *item;
-
-            for (;;) {
-                auto& next_queue = active_actor->call();
-                auto msg = next_queue.pop(std::move(item));
-                
-                if (msg) {
-                    active_actor->set_message(*msg);
-                }
-                else {
-                    break;
-                }
-            }
+            active_actor->call();
         }
     }
 };
 
-option<owner<actor>> queue_base::push_internal(owner<message>& msg) {
-    locked_region region(lock);
-    const int queue_length = length++;
-
-    if (queue_length >= 0) {
-        items.enqueue(msg);
-    } 
-    else {
-        option<owner<actor>> item = items.dequeue<actor>();
-        owner<actor>& subscriber = *item;
-        subscriber->set_message(msg);
-        return item;
-    }
-    
-    return std::nullopt;
-}
-
-option<owner<message>> queue_base::pop(option<owner<actor>>&& subscriber) {
-    locked_region region(lock);
-    const int queue_length = length--;
-
-    if (queue_length <= 0) {
-        if (subscriber) {
-            items.enqueue(*subscriber);
-        }
-    } 
-    else {
-        return items.dequeue<message>();
-    }
-
-    return std::nullopt;
-}
-
-void queue_base::push(owner<message>&& msg) {
-    option<owner<actor>> subscriber = push_internal(msg);
-    
-    if (subscriber) {
-        scheduler::activate(*subscriber);
-    }
-}
-    
 template<class T> class queue : public queue_base {
+    list items;
+    int length = 0;
+    
+    option<owner<actor>> push_internal(owner<T>& msg) {
+        locked_region region(lock);
+        const int queue_length = length++;
+
+        if (queue_length >= 0) {
+            items.enqueue(msg);
+        } 
+        else {
+            option<owner<actor>> item = items.dequeue<actor>();
+            owner<actor>& subscriber = *item;
+            subscriber->set_message(msg);
+            return item;
+        }
+        
+        return std::nullopt;
+    }
+    
+    option<owner<T>> pop_internal(actor& subscriber, std::coroutine_handle<> h) {
+        locked_region region(lock);
+        const int queue_length = length--;
+
+        if (queue_length <= 0) {
+            subscriber.set_handle(h);
+            auto subscr_owner = owner(&subscriber);
+            items.enqueue(subscr_owner);
+        } 
+        else {
+            return items.dequeue<T>();
+        }
+
+        return std::nullopt;
+    }    
+        
+protected:
+    mutex lock;
+    
+    option<owner<T>> try_pop() {
+        locked_region region(lock);
+
+        if (length > 0) {
+            --length;
+            return items.dequeue<T>();
+        } 
+        
+        return std::nullopt;
+    }
+        
 public:
+
     inline void push(owner<T>& msg) {
-        queue_base::push(msg.release());
+        option<owner<actor>> subscriber = push_internal(msg);
+        
+        if (subscriber) {
+            scheduler::activate(*subscriber);
+        }
+    }
+        
+    auto pop(actor& subscriber) {
+        
+        struct awaitable {
+            actor& subscriber;
+            queue<T>& source;
+            
+            awaitable(queue<T>& q, actor& a): subscriber(a), source(q) {}
+            
+            bool await_ready() const noexcept { 
+                option<owner<T>> msg = source.try_pop();
+                
+                if (msg) {
+                    subscriber.set_message(*msg);
+                }
+                
+                return (bool)msg;
+            }
+            
+            bool await_suspend(std::coroutine_handle<> h) {
+                option<owner<T>> msg = source.pop_internal(subscriber, h);
+                
+                if (msg) {
+                    subscriber.set_message(*msg);
+                }
+
+                return !(bool)msg;
+            }
+            
+            owner<T> await_resume() {
+                return subscriber.get_message<T>();
+            }
+        };
+        
+        return awaitable(*this, subscriber);
     }
 };
 
@@ -275,8 +308,7 @@ template<class T> class message_pool : public queue<T> {
 
         if (offset < array_length) {
             T& item = items_array[offset++];
-            message& inner_msg = static_cast<message&>(item);
-            inner_msg.set_parent(this);
+            item.parent = this;
             return owner(&item);
         }
         
@@ -293,18 +325,27 @@ public:
         auto msg = try_pick_from_array();
         
         if (!msg) {
-            option<owner<message>> item = this->pop({});
-            
-            if (item) {
-                return owner<T>(static_cast<T*>((*item).release()));
-            }
+            return this->try_pop();            
         }
 
         return msg;
     }
 };
 
+template<class T> inline auto actor::pop(queue<T>& q) {
+    return q.pop(*this);
+}
+
+template<class T> void owner<T>::drop(T* msg) {
+    queue<T>* q = static_cast<queue<T>*>(msg->parent);
+    owner<T> o = owner(msg);
+    q->push(o);
+}
+
+template<> void owner<actor>::drop(actor* a) {
+    //TODO: assert actor never dropped
+}
+
 };
 
 #endif
-

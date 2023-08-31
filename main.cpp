@@ -11,7 +11,15 @@
 
 using namespace magnesium;
 
-void operator delete(void*) {}  // all object are persistent
+void* magnesium::future::promise_type::allocate(std::size_t n) {
+    static uint8_t buffer[256];
+    static std::size_t ptr = 0;
+    const std::size_t old_ptr = ptr;
+    ptr += n;
+    return buffer + old_ptr; //TODO: panic on overflow
+}
+
+void operator delete(void*) {}  // all objects are persistent
 const int EXAMPLE_VECTOR = 20;
 
 static void panic() {
@@ -36,15 +44,15 @@ class systick_actor : public actor {
 public:
     systick_actor(unsigned int vect) noexcept : actor(vect) {}
 
-    queue_base& run(owner<message> msg) override {
-        auto m = msg.as<example_msg>();
-    
-        if (m->led_state == 0)
-            GPIOC->BSRR = GPIO_BSRR_BR13;
-        else
-            GPIOC->BSRR = GPIO_BSRR_BS13;
-
-        return g_queue;
+    future run() override {
+        for(;;) {
+            auto msg = co_await pop(g_queue);
+        
+            if (msg->led_state == 0)
+                GPIOC->BSRR = GPIO_BSRR_BR13;
+            else
+                GPIOC->BSRR = GPIO_BSRR_BS13;
+        }
     }
 };
 
@@ -97,7 +105,7 @@ extern "C" int main() {
     NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
     __enable_irq();
 
-    g_actor.poll(g_queue);
+    g_actor.start();
 
     SysTick->LOAD  = 72000U * 100 - 1U;
     SysTick->VAL   = 0;
