@@ -18,10 +18,9 @@ template<class T> using option = std::optional<T>;
 
 template<class T> class owner {
     T* ptr;
-       
     void drop(T*);
+        
 public:
-
     owner(T* pointer) noexcept : ptr(pointer) {}
 
     owner(owner&& other) noexcept : ptr(other.ptr) {
@@ -53,10 +52,11 @@ public:
 class node {
     node* next;
     node* prev;
+    
 protected:
     ~node() = default;  // can't be destructed through 'delete node'
-public:
     
+public:
     friend class list;
     friend class message;
     friend class actor;
@@ -69,12 +69,11 @@ public:
 };
 
 class list : public node {
-public:
-
     inline bool is_empty() const {
         return (this->next == this);
     }
 
+public:
     list() noexcept {
         this->next = this->prev = this;
     }
@@ -102,16 +101,11 @@ public:
     }   
 };
 
-class queue_base {};
-
-struct message : public node {
-    queue_base* parent;
-};
-
 class mutex {};
 
 class locked_region {
     mutex& lock;
+
 public:
     locked_region(mutex& object) noexcept : lock(object) {
         mg_object_lock(&lock);
@@ -120,6 +114,12 @@ public:
    ~locked_region() {
         mg_object_unlock(&lock);
     }
+};
+
+class queue_base {};
+
+struct message : public node {
+    queue_base* parent;
 };
 
 struct future {
@@ -138,13 +138,15 @@ template<class T> class queue;
 class actor : public node {
     message* mailbox = nullptr;
     std::coroutine_handle<> frame;
-        
-    virtual future run() = 0;
+
 protected:
     ~actor() = default;
+
 public:   
     const unsigned int vect;
     const unsigned int prio;
+    
+    virtual future run() = 0;
 
     actor(unsigned int vect) noexcept : vect(vect), prio(pic_vect2prio(vect)) {}
 
@@ -166,11 +168,7 @@ public:
         frame();
     }
 
-    inline void start() {
-        this->run();
-    }  
-
-    template<class T> inline auto pop(queue<T>& q);
+    template<class T> inline auto poll(queue<T>& q);
 };
    
 class scheduler {
@@ -182,7 +180,7 @@ class scheduler {
         locked_region region(context.lock);
         return runq.dequeue<actor>();
     }
-    
+
 public:
     static void activate(owner<actor>& target) {
         locked_region region(context.lock);
@@ -194,7 +192,7 @@ public:
         const unsigned int prio = pic_vect2prio(vect);
 
         while (option<owner<actor>> item = extract(context.runqueue[prio])) {
-            auto& active_actor = *item;
+            actor* active_actor = (*item).release();
             active_actor->call();
         }
     }
@@ -235,8 +233,44 @@ template<class T> class queue : public queue_base {
         }
 
         return std::nullopt;
-    }    
+    }
+
+    auto pop(actor& subscriber) {
         
+        struct awaitable {
+            actor& subscriber;
+            queue<T>& source;
+            
+            awaitable(queue<T>& q, actor& a) noexcept : subscriber(a), source(q) {}
+            
+            bool await_ready() const noexcept { 
+                option<owner<T>> msg = source.try_pop();
+                
+                if (msg) {
+                    subscriber.set_message(*msg);
+                }
+                
+                return (bool)msg;
+            }
+            
+            bool await_suspend(std::coroutine_handle<> h) const noexcept {
+                option<owner<T>> msg = source.pop_internal(subscriber, h);
+                
+                if (msg) {
+                    subscriber.set_message(*msg);
+                }
+
+                return !(bool)msg;
+            }
+            
+            owner<T> await_resume() const noexcept {
+                return subscriber.get_message<T>();
+            }
+        };
+        
+        return awaitable(*this, subscriber);
+    }
+
 protected:
     mutex lock;
     
@@ -250,9 +284,8 @@ protected:
         
         return std::nullopt;
     }
-        
+    
 public:
-
     inline void push(owner<T>& msg) {
         option<owner<actor>> subscriber = push_internal(msg);
         
@@ -260,42 +293,8 @@ public:
             scheduler::activate(*subscriber);
         }
     }
-        
-    auto pop(actor& subscriber) {
-        
-        struct awaitable {
-            actor& subscriber;
-            queue<T>& source;
-            
-            awaitable(queue<T>& q, actor& a): subscriber(a), source(q) {}
-            
-            bool await_ready() const noexcept { 
-                option<owner<T>> msg = source.try_pop();
-                
-                if (msg) {
-                    subscriber.set_message(*msg);
-                }
-                
-                return (bool)msg;
-            }
-            
-            bool await_suspend(std::coroutine_handle<> h) {
-                option<owner<T>> msg = source.pop_internal(subscriber, h);
-                
-                if (msg) {
-                    subscriber.set_message(*msg);
-                }
-
-                return !(bool)msg;
-            }
-            
-            owner<T> await_resume() {
-                return subscriber.get_message<T>();
-            }
-        };
-        
-        return awaitable(*this, subscriber);
-    }
+    
+    friend class actor;
 };
 
 template<class T> class message_pool : public queue<T> {
@@ -314,9 +313,9 @@ template<class T> class message_pool : public queue<T> {
         
         return std::nullopt;
     }
-
+    
 public:
-     template<unsigned int N> message_pool(T (&arr)[N]) : 
+     template<unsigned int N> message_pool(T (&arr)[N]) noexcept : 
         items_array(&arr[0]), 
         array_length(sizeof(arr) / sizeof(arr[0])), 
         offset(0) {}
@@ -332,14 +331,15 @@ public:
     }
 };
 
-template<class T> inline auto actor::pop(queue<T>& q) {
+template<class T> inline auto actor::poll(queue<T>& q) {
     return q.pop(*this);
 }
 
-template<class T> void owner<T>::drop(T* msg) {
-    queue<T>* q = static_cast<queue<T>*>(msg->parent);
-    owner<T> o = owner(msg);
-    q->push(o);
+template<class T> void owner<T>::drop(T* ptr) {
+    message* m = static_cast<message*>(ptr);
+    queue<T>* q = static_cast<queue<T>*>(m->parent);
+    owner<T> msg = owner(ptr);
+    q->push(msg);
 }
 
 template<> void owner<actor>::drop(actor* a) {

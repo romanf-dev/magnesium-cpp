@@ -11,20 +11,20 @@
 
 using namespace magnesium;
 
-void* magnesium::future::promise_type::allocate(std::size_t n) {
-    static uint8_t buffer[256];
-    static std::size_t ptr = 0;
-    const std::size_t old_ptr = ptr;
-    ptr += n;
-    return buffer + old_ptr; //TODO: panic on overflow
+void operator delete(void*) {}  // all objects are persistent
+const unsigned int EXAMPLE_VECTOR = 20;
+
+static inline void led_on() {
+    GPIOC->BSRR = GPIO_BSRR_BR13;
 }
 
-void operator delete(void*) {}  // all objects are persistent
-const int EXAMPLE_VECTOR = 20;
+static inline void led_off() {
+    GPIOC->BSRR = GPIO_BSRR_BS13;
+}
 
 static void panic() {
     __disable_irq();
-    GPIOC->BSRR = GPIO_BSRR_BR13;
+    led_on();
     for(;;);
 }
 
@@ -32,11 +32,23 @@ extern "C" void HardFault_Handler() {
     panic();
 }
 
+void* magnesium::future::promise_type::allocate(std::size_t n) {
+    static uint8_t buffer[256];
+    static std::size_t ptr = 0;
+    const std::size_t old_ptr = ptr;
+    ptr += n;
+    
+    if (ptr > sizeof(buffer)) {
+        panic();
+    }
+    
+    return buffer + old_ptr;
+}
+
 static struct example_msg : public message {
     unsigned int led_state;
 } g_msgs[10];
 
-scheduler scheduler::context;
 static message_pool g_pool(g_msgs);
 static queue<example_msg> g_queue;
 
@@ -46,16 +58,17 @@ public:
 
     future run() override {
         for(;;) {
-            auto msg = co_await pop(g_queue);
+            auto msg = co_await poll(g_queue);
         
             if (msg->led_state == 0)
-                GPIOC->BSRR = GPIO_BSRR_BR13;
+                led_off();
             else
-                GPIOC->BSRR = GPIO_BSRR_BS13;
+                led_on();
         }
     }
 };
 
+scheduler scheduler::context;
 static systick_actor g_actor(EXAMPLE_VECTOR);
 
 extern "C" void USB_LP_CAN1_RX0_IRQHandler() {
@@ -105,13 +118,12 @@ extern "C" int main() {
     NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
     __enable_irq();
 
-    g_actor.start();
+    g_actor.run();
 
     SysTick->LOAD  = 72000U * 100 - 1U;
     SysTick->VAL   = 0;
     SysTick->CTRL  = 7;
 
-    for (;;) __WFI();
+    for (;;);
     return 0;
 }
-
