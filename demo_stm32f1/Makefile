@@ -9,7 +9,7 @@ OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 GCC_PREFIX ?= arm-none-eabi-
 
 %.o : %.cpp
-	$(GCC_PREFIX)g++ -std=c++20 -fno-rtti -fno-exceptions -mcpu=cortex-m3 -Wall -O2 -DSTM32F103xB -mthumb -I . -c -o $@ $<
+	$(GCC_PREFIX)g++ -std=c++20 -fno-rtti -fno-exceptions -mcpu=cortex-m3 -Wall -O2 -DSTM32F103xB -DMG_NVIC_PRIO_BITS=4 -mthumb -I . -I $(MG_DIR) -c -o $@ $<
 
 %.o : %.s
 	$(GCC_PREFIX)gcc -mcpu=cortex-m3 -mthumb -c -o $@ $<

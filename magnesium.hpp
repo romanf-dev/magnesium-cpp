@@ -4,8 +4,8 @@
   * License: Public domain. The code is provided as is without any warranty.
   */
 
-#ifndef _MAGNESIUM_HPP_
-#define _MAGNESIUM_HPP_
+#ifndef MAGNESIUM_HPP
+#define MAGNESIUM_HPP
 
 #include <optional>
 #include <array>
@@ -61,8 +61,7 @@ public:
     friend class message;
     friend class actor;
 
-    // intrusive container and its items are neither copyable non movable
-    node() = default;
+    node() = default; // the container and its items are non-copyable/movable.
     node(const node&) = delete;
     node& operator=(const node& other) = delete;
     node& operator=(node&& other) = delete;
@@ -134,9 +133,11 @@ struct future {
 };
 
 template<class T> class queue;
+template<class T> class message_pool;
 
 class actor : public node {
     message* mailbox = nullptr;
+    unsigned int timeout = 0;
     std::coroutine_handle<> frame;
 
 protected:
@@ -148,13 +149,15 @@ public:
     
     virtual future run() = 0;
 
-    actor(unsigned int vect) noexcept : vect(vect), prio(pic_vect2prio(vect)) {}
+    actor(unsigned int vect) noexcept : 
+        vect(vect), 
+        prio(pic_vect2prio(vect)) {}
 
     template<class T> inline void set_message(owner<T>& msg) {
         mailbox = msg.release();
     }
     
-    template<class T> inline owner<T> get_message() {
+    template<class T> inline owner<T> take_message() {
         message* temp = mailbox;
         mailbox = nullptr;
         return owner<T>(static_cast<T*>(temp));
@@ -169,8 +172,12 @@ public:
     }
 
     template<class T> inline auto poll(queue<T>& q);
+    template<class T> inline auto get(message_pool<T>& q);
+    inline auto sleep(unsigned int delay);
+    
+    friend class timer;
 };
-   
+ 
 class scheduler {
     mutex lock;
     std::array<list, MG_PRIO_MAX> runqueue;
@@ -208,8 +215,7 @@ template<class T> class queue : public queue_base {
 
         if (queue_length >= 0) {
             items.enqueue(msg);
-        } 
-        else {
+        } else {
             option<owner<actor>> item = items.dequeue<actor>();
             owner<actor>& subscriber = *item;
             subscriber->set_message(msg);
@@ -227,21 +233,35 @@ template<class T> class queue : public queue_base {
             subscriber.set_handle(h);
             auto subscr_owner = owner(&subscriber);
             items.enqueue(subscr_owner);
-        } 
-        else {
+        } else {
             return items.dequeue<T>();
         }
 
         return std::nullopt;
     }
 
-    auto pop(actor& subscriber) {
+protected:
+    mutex lock;
+
+    option<owner<T>> try_pop() {
+        locked_region region(lock);
+
+        if (length > 0) {
+            --length;
+            return items.dequeue<T>();
+        } 
         
+        return std::nullopt;
+    }
+
+    auto pop(actor& subscriber) {
         struct awaitable {
             actor& subscriber;
             queue<T>& source;
             
-            awaitable(queue<T>& q, actor& a) noexcept : subscriber(a), source(q) {}
+            awaitable(queue<T>& q, actor& a) noexcept : 
+                subscriber(a), 
+                source(q) {}
             
             bool await_ready() const noexcept { 
                 option<owner<T>> msg = source.try_pop();
@@ -264,25 +284,11 @@ template<class T> class queue : public queue_base {
             }
             
             owner<T> await_resume() const noexcept {
-                return subscriber.get_message<T>();
+                return subscriber.take_message<T>();
             }
         };
         
         return awaitable(*this, subscriber);
-    }
-
-protected:
-    mutex lock;
-    
-    option<owner<T>> try_pop() {
-        locked_region region(lock);
-
-        if (length > 0) {
-            --length;
-            return items.dequeue<T>();
-        } 
-        
-        return std::nullopt;
     }
     
 public:
@@ -313,14 +319,25 @@ template<class T> class message_pool : public queue<T> {
         
         return std::nullopt;
     }
-    
+
+protected:
+    auto get(actor& subscriber) {
+        option<owner<T>> msg = try_pick_from_array();
+        
+        if (msg) {
+            this->push(*msg);
+        }
+        
+        return this->pop(subscriber);
+    }
+
 public:
-     template<unsigned int N> message_pool(T (&arr)[N]) noexcept : 
+    template<unsigned int N> message_pool(T (&arr)[N]) noexcept : 
         items_array(&arr[0]), 
         array_length(sizeof(arr) / sizeof(arr[0])), 
         offset(0) {}
 
-     option<owner<T>> alloc() {
+    option<owner<T>> alloc() {
         auto msg = try_pick_from_array();
         
         if (!msg) {
@@ -329,10 +346,93 @@ public:
 
         return msg;
     }
+    
+    friend class actor; 
+};
+
+class timer {
+    mutex lock;
+    std::array<list, MG_TIMERQ_MAX> subscribers;
+    std::array<size_t, MG_TIMERQ_MAX> length;
+    unsigned int ticks;
+    static timer context;
+
+    static unsigned int diff_msb(unsigned int a, unsigned int b) {
+        const unsigned int width = sizeof(unsigned int) * 8;
+        const unsigned int i = width - mg_port_clz(a ^ b) - 1;
+        return i < MG_TIMERQ_MAX ? i : MG_TIMERQ_MAX - 1;
+    }
+    
+public:
+    static void subscribe(actor& subscriber, unsigned int delay) {
+        //TODO: assert(delay < INT32_MAX);
+        locked_region region(context.lock);
+        const unsigned int timeout = context.ticks + delay;
+        const unsigned q = diff_msb(context.ticks, timeout);
+        subscriber.timeout = timeout;
+        auto subscr_owner = owner(&subscriber);
+        context.subscribers[q].enqueue(subscr_owner);
+        ++(context.length[q]);
+    }
+
+    static auto sleep(actor& subscriber, unsigned int delay) {
+        struct awaitable {
+            actor& subscriber;
+            const unsigned int delay;
+
+            awaitable(actor& a, unsigned int d) noexcept : 
+                subscriber(a), 
+                delay(d) {}
+            
+            bool await_ready() const noexcept {                 
+                return (delay == 0);
+            }
+            
+            void await_suspend(std::coroutine_handle<> h) const noexcept {
+                subscriber.set_handle(h);
+                timer::subscribe(subscriber, delay);
+            }
+            
+            void await_resume() const noexcept {}
+        };
+        
+        return awaitable(subscriber, delay);
+    }
+    
+    static void tick() {
+        locked_region region(context.lock);
+        const auto prev_tick = context.ticks++;
+        const unsigned q = diff_msb(prev_tick, context.ticks);
+        const unsigned int len = context.length[q];
+        
+        context.length[q] = 0;
+
+        for (unsigned int i = 0; i < len; ++i) {
+            option<owner<actor>> item = context.subscribers[q].dequeue<actor>();
+            const unsigned int timeout = (*item)->timeout;
+            
+            if (timeout == context.ticks) {
+                scheduler::activate(*item);
+            } else {
+                const unsigned next = diff_msb(timeout, context.ticks);;
+                context.subscribers[next].enqueue(*item);
+                ++(context.length[next]);
+            }
+            // TODO: interrupt window.
+        }
+    }
 };
 
 template<class T> inline auto actor::poll(queue<T>& q) {
     return q.pop(*this);
+}
+
+template<class T> inline auto actor::get(message_pool<T>& p) {
+    return p.get(*this);
+}
+
+inline auto actor::sleep(unsigned int delay) {
+    return timer::sleep(*this, delay);
 }
 
 template<class T> void owner<T>::drop(T* ptr) {
