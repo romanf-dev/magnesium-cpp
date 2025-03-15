@@ -7,6 +7,7 @@ SRCS = $(wildcard *.cpp)
 OBJS = $(patsubst %.cpp,%.o,$(SRCS))
 
 GCC_PREFIX ?= arm-none-eabi-
+MG_DIR ?=..
 
 %.o : %.cpp
 	$(GCC_PREFIX)g++ -std=c++20 -fno-rtti -fno-exceptions -mcpu=cortex-m0 -Wall -O2 -DSTM32F030 -DMG_NVIC_PRIO_BITS=2 -mthumb -I . -I $(MG_DIR) -c -o $@ $<
