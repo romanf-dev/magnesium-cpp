@@ -385,12 +385,18 @@ public:
                 delay(d) {}
             
             bool await_ready() const noexcept {                 
-                return (delay == 0);
+                return false;
             }
             
             void await_suspend(std::coroutine_handle<> h) const noexcept {
                 subscriber.set_handle(h);
-                timer::subscribe(subscriber, delay);
+
+                if (delay != 0) {
+                    timer::subscribe(subscriber, delay);
+                } else {
+                    auto subscr_owner = owner(&subscriber);
+                    scheduler::activate(subscr_owner);
+                }
             }
             
             void await_resume() const noexcept {}
